@@ -44,10 +44,14 @@ def _remap_added_tokens(
     """
     # Deepcopy
     special_tokens = [{**x} for x in special_tokens]
+    remapped_tokens = []
     for token in special_tokens:
-        token["id"] = vocabulary.index(token["content"])
-
-    return special_tokens
+        # Only include tokens that are actually in the vocabulary
+        if token["content"] in vocabulary:
+            token["id"] = vocabulary.index(token["content"])
+            remapped_tokens.append(token)
+    
+    return remapped_tokens
 
 
 def replace_vocabulary(
@@ -57,7 +61,8 @@ def replace_vocabulary(
     tokenizer_json: dict[str, Any] = json.loads(tokenizer.to_str())
     added_tokens: list[dict[str, Any]] = tokenizer_json["added_tokens"]
 
-    pre_tokenized_tokens = [x.normalized_form for x in new_vocabulary]
+    # Use the original form for vocabulary keys, not the normalized form
+    pre_tokenized_tokens = [x.form for x in new_vocabulary]
 
     # We need to remove the added tokens but keep [UNK] and [PAD] tokens.
     added_tokens = _rename_added_token(unk_token, "[UNK]", added_tokens, pre_tokenized_tokens)
@@ -86,6 +91,10 @@ def _rename_added_token(
     if form is None:
         return added_tokens
 
+    # Check if the form is in the vocabulary before trying to get its index
+    if form not in vocabulary:
+        return added_tokens
+    
     idx = vocabulary.index(form)
     added_token = [x for x in added_tokens if x["content"] == form]
     if added_token:
@@ -109,63 +118,65 @@ def clean_and_create_vocabulary(
 
     backend_tokenizer = tokenizer.backend_tokenizer
 
-    # Make a base list of tokens.
-    internal_vocab: dict[str, int] = tokenizer.get_vocab()
-    internal_tokens: list[str] = [k for k, _ in sorted(internal_vocab.items(), key=lambda x: x[1])]
-
-    cleaned_vocabulary = _process_internal_tokens(tokenizer, backend_tokenizer, internal_tokens, token_remove_regex)
+    # FIX: If vocabulary is provided (non-empty), use ONLY that vocabulary
+    # Do NOT add any special tokens from the model - the vocabulary is complete
+    if vocabulary:
+        # Start with empty vocabulary - we'll add all tokens from the provided vocabulary
+        cleaned_vocabulary = []
+    else:
+        # Original behavior when no vocabulary is provided: use model's internal vocabulary
+        internal_vocab: dict[str, int] = tokenizer.get_vocab()
+        internal_tokens: list[str] = [k for k, _ in sorted(internal_vocab.items(), key=lambda x: x[1])]
+        cleaned_vocabulary = _process_internal_tokens(tokenizer, backend_tokenizer, internal_tokens, token_remove_regex)
+    
     # Copy the backend tokenizer to avoid modifying the original.
     backend_tokenizer = backend_tokenizer.from_str(backend_tokenizer.to_str())
     backend_tokenizer = replace_normalizer(backend_tokenizer)
 
     internal_tokens_set = {token.form for token in cleaned_vocabulary}
 
-    normalizer: Normalizer | None = backend_tokenizer.normalizer
-    for token in vocabulary:
-        if normalizer is not None:
-            token = cast(str, normalizer.normalize_str(token))
+    # Get ALL special tokens for proper handling
+    pad_token: str | None = tokenizer.special_tokens_map.get("pad_token")  # type: ignore[assignment]
+    unk_token: str | None = tokenizer.special_tokens_map.get("unk_token")  # type: ignore[assignment]
+    
+    # Get all special tokens from the tokenizer
+    special_tokens_set = set()
+    for token_type, token_value in tokenizer.special_tokens_map.items():
+        if isinstance(token_value, str):
+            special_tokens_set.add(token_value)
+        elif isinstance(token_value, list):
+            special_tokens_set.update(token_value)
 
+    # For provided vocabulary, preserve tokens exactly as given
+    # All tokens should be treated as internal (direct token IDs)
+    for token in vocabulary:
         if not token:
             n_empty += 1
             continue
 
-        pre_tokenizer: PreTokenizer | None = backend_tokenizer.pre_tokenizer
-        normalized_token = token
-        if pre_tokenizer is not None:
-            normalized_token = _normalize_vocabulary_token(
-                token=token,
-                pre_tokenizer=pre_tokenizer,
-            )
-
-        # We need to check whether the pretokenized token is in the vocabulary.
-        # But we need to return the original token, because that will be tokenized
-        # again by the tokenizer during featurization.
-        if normalized_token in seen_tokens or normalized_token in internal_tokens_set:
+        # Check if already seen
+        if token in seen_tokens or token in internal_tokens_set:
             n_duplicates += 1
             continue
 
-        # Add the possibly pretokenized token to seen
-        seen_tokens.add(normalized_token)
+        seen_tokens.add(token)
 
-        # After checking the token exists, we need to normalize it into the token
-        # it will become. For byte tokens, this means we don't do anything. For
-        # other types of tokens, we will insert a metaspace.
-        # In the case of multiword tokens, we replace any spaces with the metaspace
-        # or byte prefix token.
-        if not normalized_token.startswith(("▁", "Ġ")):
-            normalized_token = normalized_token.replace(" ", "▁")
-            normalized_token = f"▁{normalized_token}"
-        else:
-            normalized_token = normalized_token.replace(" ", normalized_token[0])
-
-        if normalized_token in post_normalize_seen_tokens:
-            n_duplicates += 1
-            continue
-
-        post_normalize_seen_tokens.add(normalized_token)
-        # Add the original string to the vocabulary.
+        # Check if this is a special token
+        is_special_token = token in special_tokens_set
+        
+        # Check if this is a subword token (WordPiece ## prefix)
+        is_subword = token.startswith("##")
+        
+        # Add token exactly as provided, with appropriate metadata
+        # Mark special tokens as internal, but regular tokens as non-internal
+        # so they get properly encoded through the tokenizer (with BOS/EOS if needed)
         cleaned_vocabulary.append(
-            Token(form=token, normalized_form=normalized_token, is_subword=False, is_internal=False)
+            Token(
+                form=token,
+                normalized_form=token,  # Use original form, no normalization
+                is_subword=is_subword,
+                is_internal=is_special_token  # Only special tokens are internal
+            )
         )
 
     if n_duplicates:
@@ -309,7 +320,7 @@ def turn_tokens_into_ids(
     prefix, suffix = find_eos_bos(tokenizer)
 
     token_ids: list[list[int]] = []
-    for token in tokens:
+    for idx, token in enumerate(tokens):
         if token.is_internal:
             # Careful. Any incorrect tokens will just get `[UNK]``, so this could go horribly wrong
             # Cast because return type is wrong.
