@@ -34,12 +34,16 @@ class PoolingMode(str, Enum):
     - POOLER: use the model's `pooler_output`. In BERT-like models this is
                computed as the hidden state at [CLS], passed through a learned
                dense layer + activation. Not all models provide this.
+    - MAX: max pooling over all non-padding tokens.
+    - SUM: sum pooling over all non-padding tokens.
     """
 
     MEAN = "mean"
     LAST = "last"
     FIRST = "first"
     POOLER = "pooler"
+    MAX = "max"
+    SUM = "sum"
 
 
 def create_embeddings(
@@ -47,7 +51,7 @@ def create_embeddings(
     tokenized: list[list[int]],
     device: str,
     pad_token_id: int,
-    pooling: PoolingMode | str = PoolingMode.MEAN,
+    pooling: PoolingMode = PoolingMode.MEAN,
 ) -> np.ndarray:
     """
     Create output embeddings for a bunch of tokens using a pretrained model.
@@ -105,6 +109,10 @@ def create_embeddings(
             out = _encode_first_with_model(model, encoded)
         elif pooling == PoolingMode.POOLER:
             out = _encode_pooler_with_model(model, encoded)
+        elif pooling == PoolingMode.MAX:
+            out = _encode_max_with_model(model, encoded)
+        elif pooling == PoolingMode.SUM:
+            out = _encode_sum_with_model(model, encoded)
         else:
             raise ValueError(f"Unknown pooling: {pooling}")
 
@@ -206,6 +214,42 @@ def _encode_pooler_with_model(model: PreTrainedModel, encodings: dict[str, torch
     if pooler is None:
         raise ValueError("POOLER pooling requested, but model did not return pooler_output.")
     return pooler.cpu()
+
+
+@torch.inference_mode()
+def _encode_max_with_model(model: PreTrainedModel, encodings: dict[str, torch.Tensor]) -> torch.Tensor:
+    """
+    Encode a batch of tokens using max pooling.
+
+    :param model: The model to use.
+    :param encodings: The encoded tokens to turn into features.
+    :return: The max pooled representation for each token.
+    """
+    hidden, _, encodings_on_device = _encode_with_model(model, encodings)
+    # Mask padding tokens with a very large negative value so they don't affect max pooling
+    mask = encodings_on_device["attention_mask"].bool().unsqueeze(-1).to(hidden.device)
+    hidden_masked = hidden.masked_fill(~mask, float('-inf'))
+    # Take the max over the sequence dimension
+    max_pooled = torch.max(hidden_masked, dim=1)[0]
+    return max_pooled.cpu()
+
+
+@torch.inference_mode()
+def _encode_sum_with_model(model: PreTrainedModel, encodings: dict[str, torch.Tensor]) -> torch.Tensor:
+    """
+    Encode a batch of tokens using sum pooling.
+
+    :param model: The model to use.
+    :param encodings: The encoded tokens to turn into features.
+    :return: The sum pooled representation for each token.
+    """
+    hidden, _, encodings_on_device = _encode_with_model(model, encodings)
+    # Mask padding tokens with zero so they don't affect sum pooling
+    mask = encodings_on_device["attention_mask"].bool().unsqueeze(-1).to(hidden.device)
+    hidden_masked = hidden.masked_fill(~mask, 0.0)
+    # Take the sum over the sequence dimension
+    sum_pooled = torch.sum(hidden_masked, dim=1)
+    return sum_pooled.cpu()
 
 
 def post_process_embeddings(
